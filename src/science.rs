@@ -1,14 +1,127 @@
 //! Multi-Disciplinary Science Engine & Constant Registry for POLER-SciLang
 //! Spans Astrophysics, Relativity, Quantum Mechanics, Thermodynamics, Chemistry,
 //! Electromagnetism, Fluid Dynamics, and Native AVX2 ASM / Zig SIMD Hardware Acceleration.
+//! Directly bridges to sovereign ab-initio poler-engine (Hartree-Fock, Schrödinger, PDB docking, Trits, Rotors).
 
 use crate::native::*;
 use crate::units::{Dimensions, Unit};
 use crate::values::Value;
 use std::collections::HashMap;
+use std::process::Command;
 
 pub struct ScienceRegistry {
     constants: HashMap<String, Value>,
+}
+
+pub fn find_poler_engine_bin() -> String {
+    if let Ok(env_path) = std::env::var("POLER_ENGINE") {
+        if std::path::Path::new(&env_path).exists() {
+            return env_path;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let local_path = format!("{}/.local/bin/poler-engine", home);
+        if std::path::Path::new(&local_path).exists() {
+            return local_path;
+        }
+    }
+    for cand in &["/usr/local/bin/poler-engine", "/usr/bin/poler-engine"] {
+        if std::path::Path::new(cand).exists() {
+            return cand.to_string();
+        }
+    }
+    "poler-engine".to_string()
+}
+
+pub fn eval_poler_engine_expr(expr: &str) -> Result<Value, String> {
+    let bin = find_poler_engine_bin();
+    let cmd_arg = format!("calc {}", expr);
+
+    let output = Command::new(&bin)
+        .args(&["--exec", &cmd_arg, "--json"])
+        .output()
+        .map_err(|e| format!("Failed to execute poler-engine ({}): {}", bin, e))?;
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    if stdout_str.trim().is_empty() {
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("poler-engine returned empty output: {}", stderr_str));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&stdout_str)
+        .map_err(|e| format!("Failed to parse poler-engine JSON: {} (raw: {})", e, stdout_str))?;
+
+    let ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let out_raw = parsed.get("output").and_then(|v| v.as_str()).unwrap_or("");
+
+    if !ok {
+        return Err(out_raw.to_string());
+    }
+
+    let trimmed = out_raw.trim();
+
+    // Check if JSON-quoted string: e.g. "\"result\""
+    let clean_str = if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+
+    // If clean string has unescaped newlines or quotes from engine
+    let clean_unescaped = clean_str.replace("\\n", "\n").replace("\\\"", "\"");
+
+    // 1. Try parsing as f64 scalar
+    if let Ok(num) = clean_unescaped.trim().parse::<f64>() {
+        return Ok(Value::scalar_raw(num));
+    }
+
+    // 2. Try parsing as matrix: [r1c1, r1c2; r2c1, r2c2]
+    if clean_unescaped.trim().starts_with('[') && clean_unescaped.trim().ends_with(']') {
+        let inner = &clean_unescaped.trim()[1..clean_unescaped.trim().len() - 1];
+        if inner.contains(';') {
+            let row_parts: Vec<&str> = inner.split(';').collect();
+            let rows = row_parts.len();
+            let mut data = Vec::new();
+            let mut cols = 0;
+            let mut valid = true;
+            for (r_idx, row) in row_parts.iter().enumerate() {
+                let col_vals: Result<Vec<f64>, _> = row
+                    .split(',')
+                    .map(|x| x.trim().parse::<f64>())
+                    .collect();
+                match col_vals {
+                    Ok(c) => {
+                        if r_idx == 0 {
+                            cols = c.len();
+                        } else if c.len() != cols {
+                            valid = false;
+                            break;
+                        }
+                        data.extend(c);
+                    }
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid && rows > 0 && cols > 0 {
+                return Ok(Value::Matrix { data, rows, cols });
+            }
+        } else {
+            // Try parsing as 1D vector
+            let col_vals: Result<Vec<f64>, _> = inner
+                .split(',')
+                .map(|x| x.trim().parse::<f64>())
+                .collect();
+            if let Ok(vec_data) = col_vals {
+                return Ok(Value::Vector(vec_data));
+            }
+        }
+    }
+
+    // 3. Fallback to rich scientific text (e.g. Hartree-Fock report, SMILES descriptors, voice verdict)
+    Ok(Value::Text(clean_unescaped))
 }
 
 impl ScienceRegistry {
@@ -638,8 +751,46 @@ impl ScienceRegistry {
                 Ok(Value::Scalar(cs, Unit::new("m/s", Dimensions::VELOCITY, 1.0)))
             }
 
-            _ => Err(format!("Unknown scientific function '{}'", name)),
+            _ => self.call_poler_engine(name, args),
         }
+    }
+
+    pub fn call_poler_engine(&self, name: &str, args: &[Value]) -> Result<Value, String> {
+        let mut args_str = Vec::new();
+        for a in args {
+            match a {
+                Value::Scalar(v, u) => {
+                    if u.is_dimensionless() {
+                        args_str.push(format!("{}", v));
+                    } else {
+                        args_str.push(format!("{} {}", v, u));
+                    }
+                }
+                Value::Text(s) => {
+                    args_str.push(format!("\"{}\"", s.replace('\"', "\\\"")));
+                }
+                Value::Vector(v) => {
+                    let items: Vec<String> = v.iter().map(|x| format!("{}", x)).collect();
+                    args_str.push(format!("[{}]", items.join(", ")));
+                }
+                Value::Matrix { data, rows, cols } => {
+                    let mut row_strs = Vec::new();
+                    for r in 0..*rows {
+                        let mut col_strs = Vec::new();
+                        for c in 0..*cols {
+                            col_strs.push(format!("{}", data[r * cols + c]));
+                        }
+                        row_strs.push(col_strs.join(", "));
+                    }
+                    args_str.push(format!("[{}]", row_strs.join("; ")));
+                }
+                Value::Bool(b) => args_str.push(format!("{}", b)),
+                Value::Void => args_str.push("()".to_string()),
+            }
+        }
+
+        let expr = format!("{}({})", name, args_str.join(", "));
+        eval_poler_engine_expr(&expr)
     }
 
     fn arg_f64(args: &[Value], idx: usize, func: &str) -> Result<f64, String> {
